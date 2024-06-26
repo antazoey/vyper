@@ -14,6 +14,7 @@ from vyper.codegen.core import (
     add_ofst,
     bytes_data_ptr,
     calculate_type_for_external_return,
+    check_buffer_overflow_ir,
     check_external_call,
     clamp,
     clamp2,
@@ -28,6 +29,7 @@ from vyper.codegen.core import (
     get_type_for_exact_size,
     ir_tuple_from_args,
     make_setter,
+    potential_overlap,
     promote_signed_int,
     sar,
     shl,
@@ -38,9 +40,11 @@ from vyper.codegen.expr import Expr
 from vyper.codegen.ir_node import Encoding, scope_multi
 from vyper.codegen.keccak256_helper import keccak256_helper
 from vyper.evm.address_space import MEMORY
+from vyper.evm.opcodes import version_check
 from vyper.exceptions import (
     ArgumentException,
     CompilerPanic,
+    EvmVersionException,
     InvalidLiteral,
     InvalidType,
     StateAccessViolation,
@@ -230,64 +234,54 @@ class Convert(BuiltinFunctionT):
 ADHOC_SLICE_NODE_MACROS = ["~calldata", "~selfcode", "~extcode"]
 
 
-# make sure we don't overrun the source buffer, checking for overflow:
-# valid inputs satisfy:
-#   `assert !(start+length > src_len || start+length < start`
-def _make_slice_bounds_check(start, length, src_len):
-    with start.cache_when_complex("start") as (b1, start):
-        with add_ofst(start, length).cache_when_complex("end") as (b2, end):
-            arithmetic_overflow = ["lt", end, start]
-            buffer_oob = ["gt", end, src_len]
-            ok = ["iszero", ["or", arithmetic_overflow, buffer_oob]]
-            return b1.resolve(b2.resolve(["assert", ok]))
-
-
 def _build_adhoc_slice_node(sub: IRnode, start: IRnode, length: IRnode, context: Context) -> IRnode:
     assert length.is_literal, "typechecker failed"
     assert isinstance(length.value, int)  # mypy hint
 
     dst_typ = BytesT(length.value)
     # allocate a buffer for the return value
-    np = context.new_internal_variable(dst_typ)
+    buf = context.new_internal_variable(dst_typ)
 
-    # `msg.data` by `calldatacopy`
-    if sub.value == "~calldata":
-        node = [
-            "seq",
-            _make_slice_bounds_check(start, length, "calldatasize"),
-            ["mstore", np, length],
-            ["calldatacopy", np + 32, start, length],
-            np,
-        ]
-
-    # `self.code` by `codecopy`
-    elif sub.value == "~selfcode":
-        node = [
-            "seq",
-            _make_slice_bounds_check(start, length, "codesize"),
-            ["mstore", np, length],
-            ["codecopy", np + 32, start, length],
-            np,
-        ]
-
-    # `<address>.code` by `extcodecopy`
-    else:
-        assert sub.value == "~extcode" and len(sub.args) == 1
-        node = [
-            "with",
-            "_extcode_address",
-            sub.args[0],
-            [
+    with scope_multi((start, length), ("start", "length")) as (b1, (start, length)):
+        # `msg.data` by `calldatacopy`
+        if sub.value == "~calldata":
+            node = [
                 "seq",
-                _make_slice_bounds_check(start, length, ["extcodesize", "_extcode_address"]),
-                ["mstore", np, length],
-                ["extcodecopy", "_extcode_address", np + 32, start, length],
-                np,
-            ],
-        ]
+                check_buffer_overflow_ir(start, length, "calldatasize"),
+                ["mstore", buf, length],
+                ["calldatacopy", add_ofst(buf, 32), start, length],
+                buf,
+            ]
 
-    assert isinstance(length.value, int)  # mypy hint
-    return IRnode.from_list(node, typ=BytesT(length.value), location=MEMORY)
+        # `self.code` by `codecopy`
+        elif sub.value == "~selfcode":
+            node = [
+                "seq",
+                check_buffer_overflow_ir(start, length, "codesize"),
+                ["mstore", buf, length],
+                ["codecopy", add_ofst(buf, 32), start, length],
+                buf,
+            ]
+
+        # `<address>.code` by `extcodecopy`
+        else:
+            assert sub.value == "~extcode" and len(sub.args) == 1
+            node = [
+                "with",
+                "_extcode_address",
+                sub.args[0],
+                [
+                    "seq",
+                    check_buffer_overflow_ir(start, length, ["extcodesize", "_extcode_address"]),
+                    ["mstore", buf, length],
+                    ["extcodecopy", "_extcode_address", add_ofst(buf, 32), start, length],
+                    buf,
+                ],
+            ]
+
+        assert isinstance(length.value, int)  # mypy hint
+        ret = IRnode.from_list(node, typ=BytesT(length.value), location=MEMORY)
+        return b1.resolve(ret)
 
 
 # note: this and a lot of other builtins could be refactored to accept any uint type
@@ -363,6 +357,9 @@ class Slice(BuiltinFunctionT):
             # copy_bytes works on pointers.
             assert is_bytes32, src
             src = ensure_in_memory(src, context)
+
+        if potential_overlap(src, start) or potential_overlap(src, length):
+            raise CompilerPanic("risky overlap")
 
         with src.cache_when_complex("src") as (b1, src), start.cache_when_complex("start") as (
             b2,
@@ -452,7 +449,7 @@ class Slice(BuiltinFunctionT):
 
             ret = [
                 "seq",
-                _make_slice_bounds_check(start, length, src_len),
+                check_buffer_overflow_ir(start, length, src_len),
                 do_copy,
                 ["mstore", dst, length],  # set length
                 dst,  # return pointer to dst
@@ -552,10 +549,8 @@ class Concat(BuiltinFunctionT):
 
         # respect API of copy_bytes
         bufsize = dst_maxlen + 32
-        buf = context.new_internal_variable(BytesT(bufsize))
-
-        # Node representing the position of the output in memory
-        dst = IRnode.from_list(buf, typ=ret_typ, location=MEMORY, annotation="concat destination")
+        dst = context.new_internal_variable(BytesT(bufsize))
+        dst.annotation = "concat destination"
 
         ret = ["seq"]
         # stack item representing our current offset in the dst buffer
@@ -783,9 +778,9 @@ class ECRecover(BuiltinFunctionT):
                 # clear output memory first, ecrecover can return 0 bytes
                 ["mstore", output_buf, 0],
                 ["mstore", input_buf, args[0]],
-                ["mstore", input_buf + 32, args[1]],
-                ["mstore", input_buf + 64, args[2]],
-                ["mstore", input_buf + 96, args[3]],
+                ["mstore", add_ofst(input_buf, 32), args[1]],
+                ["mstore", add_ofst(input_buf, 64), args[2]],
+                ["mstore", add_ofst(input_buf, 96), args[3]],
                 ["staticcall", "gas", 1, input_buf, 128, output_buf, 32],
                 ["mload", output_buf],
             ],
@@ -799,9 +794,7 @@ class _ECArith(BuiltinFunctionT):
         args_tuple = ir_tuple_from_args(_args)
 
         args_t = args_tuple.typ
-        input_buf = IRnode.from_list(
-            context.new_internal_variable(args_t), typ=args_t, location=MEMORY
-        )
+        input_buf = context.new_internal_variable(args_t)
         ret_t = self._return_type
 
         ret = ["seq"]
@@ -872,6 +865,9 @@ class Extract32(BuiltinFunctionT):
     def build_IR(self, expr, args, kwargs, context):
         bytez, index = args
         ret_type = kwargs["output_type"]
+
+        if potential_overlap(bytez, index):
+            raise CompilerPanic("risky overlap")
 
         def finalize(ret):
             annotation = "extract32"
@@ -1103,9 +1099,7 @@ class RawCall(BuiltinFunctionT):
             args_ofst = add_ofst(input_buf, 32)
             args_len = ["mload", input_buf]
 
-        output_node = IRnode.from_list(
-            context.new_internal_variable(BytesT(outsize)), typ=BytesT(outsize), location=MEMORY
-        )
+        output_node = context.new_internal_variable(BytesT(outsize))
 
         bool_ty = BoolT()
 
@@ -1219,6 +1213,18 @@ class BlockHash(BuiltinFunctionT):
         )
 
 
+class BlobHash(BuiltinFunctionT):
+    _id = "blobhash"
+    _inputs = [("index", UINT256_T)]
+    _return_type = BYTES32_T
+
+    @process_inputs
+    def build_IR(self, expr, args, kwargs, contact):
+        if not version_check(begin="cancun"):
+            raise EvmVersionException("`blobhash` is not available pre-cancun", expr)
+        return IRnode.from_list(["blobhash", args[0]], typ=BYTES32_T)
+
+
 class RawRevert(BuiltinFunctionT):
     _id = "raw_revert"
     _inputs = [("data", BytesT.any())]
@@ -1263,6 +1269,7 @@ class RawLog(BuiltinFunctionT):
     def build_IR(self, expr, args, kwargs, context):
         topics_length = len(expr.args[0].elements)
         topics = args[0].args
+        topics = [unwrap_location(topic) for topic in topics]
 
         # sanity check topics is a literal list
         assert args[0].value in ("~empty", "multi")
@@ -1275,12 +1282,7 @@ class RawLog(BuiltinFunctionT):
             placeholder = context.new_internal_variable(BYTES32_T)
             log_ir = [log_op, placeholder, 32] + topics
             return IRnode.from_list(
-                [
-                    "seq",
-                    # TODO use make_setter
-                    ["mstore", placeholder, unwrap_location(data)],
-                    ensure_eval_once("raw_log", log_ir),
-                ]
+                ["seq", make_setter(placeholder, data), ensure_eval_once("raw_log", log_ir)]
             )
 
         input_buf = ensure_in_memory(data, context)
@@ -1658,8 +1660,8 @@ class _CreateBase(BuiltinFunctionT):
 
     @process_inputs
     def build_IR(self, expr, args, kwargs, context):
-        # errmsg something like "Cannot use {self._id} in pure fn"
-        context.check_is_not_constant("use {self._id}", expr)
+        # errmsg something like f"Cannot use {self._id} in pure fn"
+        context.check_is_not_constant(f"use {self._id}", expr)
 
         should_use_create2 = "salt" in [kwarg.arg for kwarg in expr.keywords]
 
@@ -1712,8 +1714,8 @@ class CreateMinimalProxyTo(_CreateBase):
         return [
             "seq",
             ["mstore", buf, forwarder_preamble],
-            ["mstore", ["add", buf, preamble_length], aligned_target],
-            ["mstore", ["add", buf, preamble_length + 20], forwarder_post],
+            ["mstore", add_ofst(buf, preamble_length), aligned_target],
+            ["mstore", add_ofst(buf, preamble_length + 20), forwarder_post],
             _create_ir(value, buf, buf_len, salt, revert_on_failure),
         ]
 
@@ -1812,9 +1814,15 @@ class CreateFromBlueprint(_CreateBase):
             if len(ctor_args) != 1 or not isinstance(ctor_args[0].typ, BytesT):
                 raise StructureException("raw_args must be used with exactly 1 bytes argument")
 
-            argbuf = bytes_data_ptr(ctor_args[0])
-            argslen = get_bytearray_length(ctor_args[0])
-            bufsz = ctor_args[0].typ.maxlen
+            with ctor_args[0].cache_when_complex("arg") as (b1, arg):
+                argbuf = bytes_data_ptr(arg)
+                argslen = get_bytearray_length(arg)
+                bufsz = arg.typ.maxlen
+                return b1.resolve(
+                    self._helper(
+                        argbuf, bufsz, target, value, salt, argslen, code_offset, revert_on_failure
+                    )
+                )
         else:
             # encode the varargs
             to_encode = ir_tuple_from_args(ctor_args)
@@ -1822,14 +1830,16 @@ class CreateFromBlueprint(_CreateBase):
             # pretend we allocated enough memory for the encoder
             # (we didn't, but we are clobbering unused memory so it's safe.)
             bufsz = to_encode.typ.abi_type.size_bound()
-            argbuf = IRnode.from_list(
-                context.new_internal_variable(get_type_for_exact_size(bufsz)), location=MEMORY
-            )
+            argbuf = context.new_internal_variable(get_type_for_exact_size(bufsz))
 
             # return a complex expression which writes to memory and returns
             # the length of the encoded data
             argslen = abi_encode(argbuf, to_encode, context, bufsz=bufsz, returns_len=True)
+            return self._helper(
+                argbuf, bufsz, target, value, salt, argslen, code_offset, revert_on_failure
+            )
 
+    def _helper(self, argbuf, bufsz, target, value, salt, argslen, code_offset, revert_on_failure):
         # NOTE: we need to invoke the abi encoder before evaluating MSIZE,
         # then copy the abi encoded buffer to past-the-end of the initcode
         # (since the abi encoder could write to fresh memory).
@@ -2071,13 +2081,17 @@ class Uint2Str(BuiltinFunctionT):
                     # clobber val, and return it as a pointer
                     [
                         "seq",
-                        ["mstore", ["sub", buf + n_digits, i], i],
-                        ["set", val, ["sub", buf + n_digits, i]],
+                        ["mstore", ["sub", add_ofst(buf, n_digits), i], i],
+                        ["set", val, ["sub", add_ofst(buf, n_digits), i]],
                         "break",
                     ],
                     [
                         "seq",
-                        ["mstore", ["sub", buf + n_digits, i], ["add", 48, ["mod", val, 10]]],
+                        [
+                            "mstore",
+                            ["sub", add_ofst(buf, n_digits), i],
+                            ["add", 48, ["mod", val, 10]],
+                        ],
                         ["set", val, ["div", val, 10]],
                     ],
                 ],
@@ -2093,7 +2107,7 @@ class Uint2Str(BuiltinFunctionT):
             ret = [
                 "if",
                 ["eq", val, 0],
-                ["seq", ["mstore", buf + 1, ord("0")], ["mstore", buf, 1], buf],
+                ["seq", ["mstore", add_ofst(buf, 1), ord("0")], ["mstore", buf, 1], buf],
                 ["seq", ret, val],
             ]
 
@@ -2112,7 +2126,8 @@ class Sqrt(BuiltinFunctionT):
 
         arg = args[0]
         # TODO: reify decimal and integer sqrt paths (see isqrt)
-        sqrt_code = """
+        with arg.cache_when_complex("x") as (b1, arg):
+            sqrt_code = """
 assert x >= 0.0
 z: decimal = 0.0
 
@@ -2127,33 +2142,34 @@ else:
             break
         y = z
         z = (x / z + z) / 2.0
-        """
+            """
 
-        x_type = DecimalT()
-        placeholder_copy = ["pass"]
-        # Steal current position if variable is already allocated.
-        if arg.value == "mload":
-            new_var_pos = arg.args[0]
-        # Other locations need to be copied.
-        else:
-            new_var_pos = context.new_internal_variable(x_type)
-            placeholder_copy = ["mstore", new_var_pos, arg]
-        # Create input variables.
-        variables = {"x": VariableRecord(name="x", pos=new_var_pos, typ=x_type, mutable=False)}
-        # Dictionary to update new (i.e. typecheck) namespace
-        variables_2 = {"x": VarInfo(DecimalT())}
-        # Generate inline IR.
-        new_ctx, sqrt_ir = generate_inline_function(
-            code=sqrt_code,
-            variables=variables,
-            variables_2=variables_2,
-            memory_allocator=context.memory_allocator,
-        )
-        return IRnode.from_list(
-            ["seq", placeholder_copy, sqrt_ir, new_ctx.vars["z"].pos],  # load x variable
-            typ=DecimalT(),
-            location=MEMORY,
-        )
+            x_type = DecimalT()
+            placeholder_copy = ["pass"]
+            # Steal current position if variable is already allocated.
+            if arg.value == "mload":
+                new_var_pos = arg.args[0]
+            # Other locations need to be copied.
+            else:
+                new_var_pos = context.new_internal_variable(x_type)
+                placeholder_copy = ["mstore", new_var_pos, arg]
+            # Create input variables.
+            variables = {"x": VariableRecord(name="x", pos=new_var_pos, typ=x_type, mutable=False)}
+            # Dictionary to update new (i.e. typecheck) namespace
+            variables_2 = {"x": VarInfo(DecimalT())}
+            # Generate inline IR.
+            new_ctx, sqrt_ir = generate_inline_function(
+                code=sqrt_code,
+                variables=variables,
+                variables_2=variables_2,
+                memory_allocator=context.memory_allocator,
+            )
+            ret = IRnode.from_list(
+                ["seq", placeholder_copy, sqrt_ir, new_ctx.vars["z"].pos],  # load x variable
+                typ=DecimalT(),
+                location=MEMORY,
+            )
+            return b1.resolve(ret)
 
 
 class ISqrt(BuiltinFunctionT):
@@ -2271,13 +2287,13 @@ class Print(BuiltinFunctionT):
 
             ret = ["seq"]
             ret.append(["mstore", buf, method_id])
-            encode = abi_encode(buf + 32, args_as_tuple, context, buflen, returns_len=True)
+            encode = abi_encode(add_ofst(buf, 32), args_as_tuple, context, buflen, returns_len=True)
 
         else:
             method_id = method_id_int("log(string,bytes)")
             schema = args_abi_t.selector_name().encode("utf-8")
             if len(schema) > 32:
-                raise CompilerPanic("print signature too long: {schema}")
+                raise CompilerPanic(f"print signature too long: {schema}")
 
             schema_t = StringT(len(schema))
             schema_buf = context.new_internal_variable(schema_t)
@@ -2285,7 +2301,9 @@ class Print(BuiltinFunctionT):
             ret.append(["mstore", schema_buf, len(schema)])
 
             # TODO use Expr.make_bytelike, or better have a `bytestring` IRnode type
-            ret.append(["mstore", schema_buf + 32, bytes_to_int(schema.ljust(32, b"\x00"))])
+            ret.append(
+                ["mstore", add_ofst(schema_buf, 32), bytes_to_int(schema.ljust(32, b"\x00"))]
+            )
 
             payload_buflen = args_abi_t.size_bound()
             payload_t = BytesT(payload_buflen)
@@ -2293,7 +2311,7 @@ class Print(BuiltinFunctionT):
             # 32 bytes extra space for the method id
             payload_buf = context.new_internal_variable(payload_t)
             encode_payload = abi_encode(
-                payload_buf + 32, args_as_tuple, context, payload_buflen, returns_len=True
+                add_ofst(payload_buf, 32), args_as_tuple, context, payload_buflen, returns_len=True
             )
 
             ret.append(["mstore", payload_buf, encode_payload])
@@ -2308,17 +2326,19 @@ class Print(BuiltinFunctionT):
             buflen = 32 + args_as_tuple.typ.abi_type.size_bound()
             buf = context.new_internal_variable(get_type_for_exact_size(buflen))
             ret.append(["mstore", buf, method_id])
-            encode = abi_encode(buf + 32, args_as_tuple, context, buflen, returns_len=True)
+            encode = abi_encode(add_ofst(buf, 32), args_as_tuple, context, buflen, returns_len=True)
 
         # debug address that tooling uses
         CONSOLE_ADDRESS = 0x000000000000000000636F6E736F6C652E6C6F67
-        ret.append(["staticcall", "gas", CONSOLE_ADDRESS, buf + 28, ["add", 4, encode], 0, 0])
+        ret.append(
+            ["staticcall", "gas", CONSOLE_ADDRESS, add_ofst(buf, 28), ["add", 4, encode], 0, 0]
+        )
 
         return IRnode.from_list(ret, annotation="print:" + sig)
 
 
 class ABIEncode(BuiltinFunctionT):
-    _id = "_abi_encode"  # TODO prettier to rename this to abi.encode
+    _id = "abi_encode"
     # signature: *, ensure_tuple=<literal_bool> -> Bytes[<calculated len>]
     # explanation of ensure_tuple:
     # default is to force even a single value into a tuple,
@@ -2415,15 +2435,19 @@ class ABIEncode(BuiltinFunctionT):
             # <32 bytes length> | <4 bytes method_id> | <everything else>
             # write the unaligned method_id first, then we will
             # overwrite the 28 bytes of zeros with the bytestring length
-            ret += [["mstore", buf + 4, method_id]]
+            ret += [["mstore", add_ofst(buf, 4), method_id]]
             # abi encode, and grab length as stack item
-            length = abi_encode(buf + 36, encode_input, context, returns_len=True, bufsz=maxlen)
+            length = abi_encode(
+                add_ofst(buf, 36), encode_input, context, returns_len=True, bufsz=maxlen
+            )
             # write the output length to where bytestring stores its length
             ret += [["mstore", buf, ["add", length, 4]]]
 
         else:
             # abi encode and grab length as stack item
-            length = abi_encode(buf + 32, encode_input, context, returns_len=True, bufsz=maxlen)
+            length = abi_encode(
+                add_ofst(buf, 32), encode_input, context, returns_len=True, bufsz=maxlen
+            )
             # write the output length to where bytestring stores its length
             ret += [["mstore", buf, length]]
 
@@ -2435,7 +2459,7 @@ class ABIEncode(BuiltinFunctionT):
 
 
 class ABIDecode(BuiltinFunctionT):
-    _id = "_abi_decode"
+    _id = "abi_decode"
     _inputs = [("data", BytesT.any()), ("output_type", TYPE_T.any())]
     _kwargs = {"unwrap_tuple": KwargSettings(BoolT(), True, require_literal=True)}
 
@@ -2465,7 +2489,7 @@ class ABIDecode(BuiltinFunctionT):
             wrapped_typ = calculate_type_for_external_return(output_typ)
 
         abi_size_bound = wrapped_typ.abi_type.size_bound()
-        abi_min_size = wrapped_typ.abi_type.min_size()
+        abi_min_size = wrapped_typ.abi_type.static_size()
 
         # Get the size of data
         input_max_len = data.typ.maxlen
@@ -2489,6 +2513,10 @@ class ABIDecode(BuiltinFunctionT):
 
             ret = ["seq"]
 
+            # NOTE: we could replace these 4 lines with
+            # `[assert [le, abi_min_size, data_len]]`. it depends on
+            # what we consider a "valid" payload.
+            # cf. test_abi_decode_max_size()
             if abi_min_size == abi_size_bound:
                 ret.append(["assert", ["eq", abi_min_size, data_len]])
             else:
@@ -2508,17 +2536,42 @@ class ABIDecode(BuiltinFunctionT):
             # input validation
 
             output_buf = context.new_internal_variable(wrapped_typ)
-            output = IRnode.from_list(output_buf, typ=wrapped_typ, location=MEMORY)
 
             # sanity check buffer size for wrapped output type will not buffer overflow
             assert wrapped_typ.memory_bytes_required == output_typ.memory_bytes_required
-            ret.append(make_setter(output, to_decode))
 
-            ret.append(output)
+            # pass a buffer bound to make_setter so appropriate oob
+            # validation is performed
+            buf_bound = add_ofst(data_ptr, data_len)
+            ret.append(make_setter(output_buf, to_decode, hi=buf_bound))
+
+            ret.append(output_buf)
             # finalize. set the type and location for the return buffer.
             # (note: unwraps the tuple type if necessary)
             ret = IRnode.from_list(ret, typ=output_typ, location=MEMORY)
             return b1.resolve(ret)
+
+
+class OldABIEncode(ABIEncode):
+    _warned = False
+    _id = "_abi_encode"
+
+    def _try_fold(self, node):
+        if not self.__class__._warned:
+            vyper_warn(f"`{self._id}()` is deprecated! Please use `{super()._id}()` instead.", node)
+            self.__class__._warned = True
+        super()._try_fold(node)
+
+
+class OldABIDecode(ABIDecode):
+    _warned = False
+    _id = "_abi_decode"
+
+    def _try_fold(self, node):
+        if not self.__class__._warned:
+            vyper_warn(f"`{self._id}()` is deprecated! Please use `{super()._id}()` instead.", node)
+            self.__class__._warned = True
+        super()._try_fold(node)
 
 
 class _MinMaxValue(TypenameFoldedFunctionT):
@@ -2573,8 +2626,10 @@ class Epsilon(TypenameFoldedFunctionT):
 
 
 DISPATCH_TABLE = {
-    "_abi_encode": ABIEncode(),
-    "_abi_decode": ABIDecode(),
+    "abi_encode": ABIEncode(),
+    "abi_decode": ABIDecode(),
+    "_abi_encode": OldABIEncode(),
+    "_abi_decode": OldABIDecode(),
     "floor": Floor(),
     "ceil": Ceil(),
     "convert": Convert(),
@@ -2591,6 +2646,7 @@ DISPATCH_TABLE = {
     "as_wei_value": AsWeiValue(),
     "raw_call": RawCall(),
     "blockhash": BlockHash(),
+    "blobhash": BlobHash(),
     "bitwise_and": BitwiseAnd(),
     "bitwise_or": BitwiseOr(),
     "bitwise_xor": BitwiseXor(),

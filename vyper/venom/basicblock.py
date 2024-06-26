@@ -1,17 +1,19 @@
-from typing import TYPE_CHECKING, Any, Generator, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Any, Iterator, Optional, Union
 
+from vyper.codegen.ir_node import IRnode
 from vyper.utils import OrderedSet
 
 # instructions which can terminate a basic block
-BB_TERMINATORS = frozenset(["jmp", "djmp", "jnz", "ret", "return", "revert", "stop", "exit"])
+BB_TERMINATORS = frozenset(["jmp", "djmp", "jnz", "ret", "return", "stop", "exit"])
 
 VOLATILE_INSTRUCTIONS = frozenset(
     [
         "param",
-        "alloca",
         "call",
         "staticcall",
         "delegatecall",
+        "create",
+        "create2",
         "invoke",
         "sload",
         "sstore",
@@ -34,6 +36,15 @@ VOLATILE_INSTRUCTIONS = frozenset(
         "ret",
         "jmp",
         "jnz",
+        "djmp",
+        "log",
+        "selfdestruct",
+        "invalid",
+        "revert",
+        "assert",
+        "assert_unreachable",
+        "stop",
+        "exit",
     ]
 )
 
@@ -41,8 +52,8 @@ NO_OUTPUT_INSTRUCTIONS = frozenset(
     [
         "mstore",
         "sstore",
-        "dstore",
         "istore",
+        "tstore",
         "dloadbytes",
         "calldatacopy",
         "mcopy",
@@ -64,6 +75,10 @@ NO_OUTPUT_INSTRUCTIONS = frozenset(
         "log",
         "exit",
     ]
+)
+
+assert VOLATILE_INSTRUCTIONS.issuperset(NO_OUTPUT_INSTRUCTIONS), (
+    NO_OUTPUT_INSTRUCTIONS - VOLATILE_INSTRUCTIONS
 )
 
 CFG_ALTERING_INSTRUCTIONS = frozenset(["jmp", "djmp", "jnz"])
@@ -190,16 +205,15 @@ class IRInstruction:
     """
 
     opcode: str
-    volatile: bool
     operands: list[IROperand]
     output: Optional[IROperand]
     # set of live variables at this instruction
     liveness: OrderedSet[IRVariable]
     dup_requirements: OrderedSet[IRVariable]
-    parent: Optional["IRBasicBlock"]
+    parent: "IRBasicBlock"
     fence_id: int
     annotation: Optional[str]
-    ast_source: Optional[int]
+    ast_source: Optional[IRnode]
     error_msg: Optional[str]
 
     def __init__(
@@ -211,34 +225,40 @@ class IRInstruction:
         assert isinstance(opcode, str), "opcode must be an str"
         assert isinstance(operands, list | Iterator), "operands must be a list"
         self.opcode = opcode
-        self.volatile = opcode in VOLATILE_INSTRUCTIONS
         self.operands = list(operands)  # in case we get an iterator
         self.output = output
         self.liveness = OrderedSet()
         self.dup_requirements = OrderedSet()
-        self.parent = None
         self.fence_id = -1
         self.annotation = None
         self.ast_source = None
         self.error_msg = None
 
-    def get_label_operands(self) -> list[IRLabel]:
+    @property
+    def is_volatile(self) -> bool:
+        return self.opcode in VOLATILE_INSTRUCTIONS
+
+    @property
+    def is_bb_terminator(self) -> bool:
+        return self.opcode in BB_TERMINATORS
+
+    def get_label_operands(self) -> Iterator[IRLabel]:
         """
         Get all labels in instruction.
         """
-        return [op for op in self.operands if isinstance(op, IRLabel)]
+        return (op for op in self.operands if isinstance(op, IRLabel))
 
-    def get_non_label_operands(self) -> list[IROperand]:
+    def get_non_label_operands(self) -> Iterator[IROperand]:
         """
         Get input operands for instruction which are not labels
         """
-        return [op for op in self.operands if not isinstance(op, IRLabel)]
+        return (op for op in self.operands if not isinstance(op, IRLabel))
 
-    def get_inputs(self) -> list[IRVariable]:
+    def get_input_variables(self) -> Iterator[IRVariable]:
         """
         Get all input operands for instruction.
         """
-        return [op for op in self.operands if isinstance(op, IRVariable)]
+        return (op for op in self.operands if isinstance(op, IRVariable))
 
     def get_outputs(self) -> list[IROperand]:
         """
@@ -268,7 +288,7 @@ class IRInstruction:
                 self.operands[i] = replacements[operand.value]
 
     @property
-    def phi_operands(self) -> Generator[tuple[IRLabel, IRVariable], None, None]:
+    def phi_operands(self) -> Iterator[tuple[IRLabel, IROperand]]:
         """
         Get phi operands for instruction.
         """
@@ -277,8 +297,29 @@ class IRInstruction:
             label = self.operands[i]
             var = self.operands[i + 1]
             assert isinstance(label, IRLabel), "phi operand must be a label"
-            assert isinstance(var, IRVariable), "phi operand must be a variable"
+            assert isinstance(
+                var, (IRVariable, IRLiteral)
+            ), "phi operand must be a variable or literal"
             yield label, var
+
+    def remove_phi_operand(self, label: IRLabel) -> None:
+        """
+        Remove a phi operand from the instruction.
+        """
+        assert self.opcode == "phi", "instruction must be a phi"
+        for i in range(0, len(self.operands), 2):
+            if self.operands[i] == label:
+                del self.operands[i : i + 2]
+                return
+
+    def get_ast_source(self) -> Optional[IRnode]:
+        if self.ast_source:
+            return self.ast_source
+        idx = self.parent.instructions.index(self)
+        for inst in reversed(self.parent.instructions[:idx]):
+            if inst.ast_source:
+                return inst.ast_source
+        return self.parent.parent.ast_source
 
     def __repr__(self) -> str:
         s = ""
@@ -451,6 +492,15 @@ class IRBasicBlock:
         """
         return [inst.output for inst in self.instructions if inst.output]
 
+    def get_uses(self) -> dict[IRVariable, OrderedSet[IRInstruction]]:
+        uses: dict[IRVariable, OrderedSet[IRInstruction]] = {}
+        for inst in self.instructions:
+            for op in inst.get_input_variables():
+                if op not in uses:
+                    uses[op] = OrderedSet()
+                uses[op].add(inst)
+        return uses
+
     @property
     def is_empty(self) -> bool:
         """
@@ -467,7 +517,7 @@ class IRBasicBlock:
         # if we can/need to append instructions to the basic block.
         if len(self.instructions) == 0:
             return False
-        return self.instructions[-1].opcode in BB_TERMINATORS
+        return self.instructions[-1].is_bb_terminator
 
     @property
     def is_terminal(self) -> bool:
@@ -477,7 +527,7 @@ class IRBasicBlock:
         return len(self.cfg_out) == 0
 
     @property
-    def in_vars(self) -> OrderedSet[IRVariable]:
+    def liveness_in_vars(self) -> OrderedSet[IRVariable]:
         for inst in self.instructions:
             if inst.opcode != "phi":
                 return inst.liveness

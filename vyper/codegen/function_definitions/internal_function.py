@@ -49,7 +49,7 @@ def generate_ir_for_internal_function(
     for arg in func_t.arguments:
         # allocate a variable for every arg, setting mutability
         # to True to allow internal function arguments to be mutable
-        context.new_variable(arg.name, arg.typ, is_mutable=True)
+        context.new_variable(arg.name, arg.typ, is_mutable=True, internal_function=True)
 
     # Get nonreentrant lock
     nonreentrant_pre, nonreentrant_post = get_nonreentrant_lock(func_t)
@@ -82,4 +82,7 @@ def generate_ir_for_internal_function(
     func_t._ir_info.gas_estimate = ir_node.gas
     tag_frame_info(func_t, context)
 
-    return InternalFuncIR(ir_node)
+    ret = InternalFuncIR(ir_node)
+    func_t._ir_info.func_ir = ret
+
+    return ret

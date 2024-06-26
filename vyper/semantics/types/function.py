@@ -165,7 +165,11 @@ class ContractFunctionT(VyperType):
         return self._variable_reads | self._variable_writes
 
     def uses_state(self):
-        return self.nonreentrant or uses_state(self.get_variable_accesses())
+        return (
+            self.nonreentrant
+            or uses_state(self.get_variable_accesses())
+            or any(f.nonreentrant for f in self.reachable_internal_functions)
+        )
 
     def get_used_modules(self):
         # _used_modules is populated during analysis
@@ -345,8 +349,6 @@ class ContractFunctionT(VyperType):
                 "function body in an interface can only be `...`!", funcdef
             )
 
-        assert function_visibility is not None  # mypy hint
-
         return cls(
             funcdef.name,
             positional_args,
@@ -401,8 +403,7 @@ class ContractFunctionT(VyperType):
                 )
             if function_visibility != FunctionVisibility.DEPLOY:
                 raise FunctionDeclarationException(
-                    f"Constructor must be marked as `@deploy`, not `@{function_visibility}`",
-                    funcdef,
+                    "Constructor must be marked as `@deploy`", funcdef
                 )
             if return_type is not None:
                 raise FunctionDeclarationException(
@@ -414,9 +415,6 @@ class ContractFunctionT(VyperType):
                 raise FunctionDeclarationException(
                     "Constructor may not use default arguments", funcdef.args.defaults[0]
                 )
-
-        # sanity check
-        assert function_visibility is not None
 
         return cls(
             funcdef.name,
@@ -456,7 +454,10 @@ class ContractFunctionT(VyperType):
         """
         if not node.is_public:
             raise CompilerPanic("getter generated for non-public function")
-        type_ = type_from_annotation(node.annotation, DataLocation.STORAGE)
+
+        # calculated by caller (ModuleAnalyzer.visit_VariableDecl)
+        type_ = node.target._metadata["varinfo"].typ
+
         arguments, return_type = type_.getter_signature
         args = []
         for i, item in enumerate(arguments):
@@ -695,7 +696,7 @@ def _parse_return_type(funcdef: vy_ast.FunctionDef) -> Optional[VyperType]:
 
 def _parse_decorators(
     funcdef: vy_ast.FunctionDef,
-) -> tuple[Optional[FunctionVisibility], StateMutability, bool]:
+) -> tuple[FunctionVisibility, StateMutability, bool]:
     function_visibility = None
     state_mutability = None
     nonreentrant_node = None
@@ -751,9 +752,7 @@ def _parse_decorators(
             raise StructureException("Bad decorator syntax", decorator)
 
     if function_visibility is None:
-        raise FunctionDeclarationException(
-            f"Visibility must be set to one of: {', '.join(FunctionVisibility.values())}", funcdef
-        )
+        function_visibility = FunctionVisibility.INTERNAL
 
     if state_mutability is None:
         # default to nonpayable
@@ -762,8 +761,6 @@ def _parse_decorators(
     if state_mutability == StateMutability.PURE and nonreentrant_node is not None:
         raise StructureException("Cannot use reentrancy guard on pure functions", nonreentrant_node)
 
-    # assert function_visibility is not None  # mypy
-    # assert state_mutability is not None  # mypy
     nonreentrant = nonreentrant_node is not None
     return function_visibility, state_mutability, nonreentrant
 
